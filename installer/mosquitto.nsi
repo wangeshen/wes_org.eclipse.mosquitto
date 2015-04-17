@@ -7,7 +7,7 @@
 !define env_hklm 'HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"'
 
 Name "mosquitto"
-!define VERSION 1.3.5
+!define VERSION 1.4.2
 OutFile "mosquitto-${VERSION}-install-win32.exe"
 
 InstallDir "$PROGRAMFILES\mosquitto"
@@ -18,6 +18,10 @@ InstallDir "$PROGRAMFILES\mosquitto"
 !insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
+
+!define MUI_FINISHPAGE_TEXT "mosquitto has been installed on your computer.\n\nTo complete the installation you must install the dependencies described in the following readme.\n\nClick Finish to close this wizard."
+!define MUI_FINISHPAGE_SHOWREADME $INSTDIR\readme-windows.txt
+!define MUI_FINISHPAGE_SHOWREADME_TEXT "Show dependencies readme"
 !insertmacro MUI_PAGE_FINISH
 
 
@@ -30,7 +34,6 @@ InstallDir "$PROGRAMFILES\mosquitto"
 
 ;--------------------------------
 ; Languages
-
 !insertmacro MUI_LANGUAGE "English"
 
 ;--------------------------------
@@ -51,11 +54,11 @@ Section "Files" SecInstall
 	File "..\pwfile.example"
 	File "..\readme.txt"
 	File "..\readme-windows.txt"
-	File "C:\pthreads\Pre-built.2\dll\x86\pthreadVC2.dll"
-	File "C:\OpenSSL-Win32\libeay32.dll"
-	File "C:\OpenSSL-Win32\ssleay32.dll"
-	File "..\LICENSE.txt"
-	File "..\LICENSE-3rd-party.txt"
+	;File "C:\pthreads\Pre-built.2\dll\x86\pthreadVC2.dll"
+	;File "C:\OpenSSL-Win32\libeay32.dll"
+	;File "C:\OpenSSL-Win32\ssleay32.dll"
+	File "..\edl-v10"
+	File "..\epl-v10"
 
 	SetOutPath "$INSTDIR\devel"
 	File "..\lib\mosquitto.h"
@@ -64,11 +67,6 @@ Section "Files" SecInstall
 	File "..\build\lib\cpp\Release\mosquittopp.lib"
 	File "..\src\mosquitto_plugin.h"
 
-	SetOutPath "$INSTDIR\python"
-	File "..\lib\python\mosquitto.py"
-	File "..\lib\python\setup.py"
-	File "..\lib\python\sub.py"
-	
 	WriteUninstaller "$INSTDIR\Uninstall.exe"
 	WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Mosquitto" "DisplayName" "Mosquitto MQTT broker"
 	WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Mosquitto" "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
@@ -101,21 +99,17 @@ Section "Uninstall"
 	Delete "$INSTDIR\pwfile.example"
 	Delete "$INSTDIR\readme.txt"
 	Delete "$INSTDIR\readme-windows.txt"
-	Delete "$INSTDIR\pthreadVC2.dll"
-	Delete "$INSTDIR\libeay32.dll"
-	Delete "$INSTDIR\ssleay32.dll"
-	Delete "$INSTDIR\LICENSE.txt"
-	Delete "$INSTDIR\LICENSE-3rd-party.txt"
+	;Delete "$INSTDIR\pthreadVC2.dll"
+	;Delete "$INSTDIR\libeay32.dll"
+	;Delete "$INSTDIR\ssleay32.dll"
+	Delete "$INSTDIR\edl-v10"
+	Delete "$INSTDIR\epl-v10"
 
 	Delete "$INSTDIR\devel\mosquitto.h"
 	Delete "$INSTDIR\devel\mosquitto.lib"
 	Delete "$INSTDIR\devel\mosquittopp.h"
 	Delete "$INSTDIR\devel\mosquittopp.lib"
 	Delete "$INSTDIR\devel\mosquitto_plugin.h"
-
-	Delete "$INSTDIR\python\mosquitto.py"
-	Delete "$INSTDIR\python\setup.py"
-	Delete "$INSTDIR\python\sub.py"
 
 	Delete "$INSTDIR\Uninstall.exe"
 	RMDir "$INSTDIR"

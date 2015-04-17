@@ -121,11 +121,11 @@ void _mosquitto_message_queue(struct mosquitto *mosq, struct mosquitto_message_a
 			mosq->out_messages = message;
 		}
 		mosq->out_messages_last = message;
-	}else{
-		mosq->in_queue_len++;
 		if(message->msg.qos > 0 && (mosq->max_inflight_messages == 0 || mosq->inflight_messages < mosq->max_inflight_messages)){
 			mosq->inflight_messages++;
 		}
+	}else{
+		mosq->in_queue_len++;
 		message->next = NULL;
 		if(mosq->in_messages_last){
 			mosq->in_messages_last->next = message;
@@ -277,9 +277,6 @@ int _mosquitto_message_remove(struct mosquitto *mosq, uint16_t mid, enum mosquit
 				}else if(!mosq->in_messages){
 					mosq->in_messages_last = NULL;
 				}
-				if(cur->msg.qos == 2){
-					mosq->inflight_messages--;
-				}
 				found = true;
 				break;
 			}
@@ -326,7 +323,7 @@ void _mosquitto_message_retry_check_actual(struct mosquitto *mosq, struct mosqui
 				case mosq_ms_wait_for_pubcomp:
 					messages->timestamp = now;
 					messages->dup = true;
-					_mosquitto_send_pubrel(mosq, messages->msg.mid, true);
+					_mosquitto_send_pubrel(mosq, messages->msg.mid);
 					break;
 				default:
 					break;

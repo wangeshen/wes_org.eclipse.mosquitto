@@ -264,10 +264,30 @@ bool mosquittopp::want_write()
 	return mosquitto_want_write(m_mosq);
 }
 
+int mosquittopp::opts_set(enum mosq_opt_t option, void *value)
+{
+	return mosquitto_opts_set(m_mosq, option, value);
+}
+
+int mosquittopp::threaded_set(bool threaded)
+{
+	return mosquitto_threaded_set(m_mosq, threaded);
+}
+
 void mosquittopp::user_data_set(void *userdata)
 {
 	mosquitto_user_data_set(m_mosq, userdata);
 }
+
+int mosquittopp::socks5_set(const char *host, int port, const char *username, const char *password)
+{
+#ifdef WITH_SOCKS
+	return mosquitto_socks5_set(m_mosq, host, port, username, password);
+#else
+	return MOSQ_ERR_NOT_SUPPORTED;
+#endif
+}
+
 
 int mosquittopp::tls_set(const char *cafile, const char *capath, const char *certfile, const char *keyfile, int (*pw_callback)(char *buf, int size, int rwflag, void *userdata))
 {

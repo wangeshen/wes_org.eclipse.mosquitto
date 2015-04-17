@@ -28,7 +28,7 @@ Contributors:
 #include <ws2tcpip.h>
 #endif
 
-#ifdef ANDROID
+#ifdef __ANDROID__
 #include <linux/in.h>
 #include <linux/in6.h>
 #include <sys/endian.h>
@@ -51,6 +51,8 @@ Contributors:
 #endif
 
 #ifdef WITH_TLS
+#include <openssl/conf.h>
+#include <openssl/engine.h>
 #include <openssl/err.h>
 #include <tls_mosq.h>
 #endif
@@ -64,6 +66,9 @@ Contributors:
    extern unsigned long g_msgs_sent;
    extern unsigned long g_pub_msgs_received;
    extern unsigned long g_pub_msgs_sent;
+#  endif
+#  ifdef WITH_WEBSOCKETS
+#    include <libwebsockets.h>
 #  endif
 #else
 #  include <read_handle.h>
@@ -104,6 +109,9 @@ void _mosquitto_net_init(void)
 void _mosquitto_net_cleanup(void)
 {
 #ifdef WITH_TLS
+	ERR_remove_state(0);
+	ENGINE_cleanup();
+	CONF_modules_unload(1);
 	ERR_free_strings();
 	EVP_cleanup();
 	CRYPTO_cleanup_all_ex_data();
@@ -124,7 +132,6 @@ void _mosquitto_packet_cleanup(struct _mosquitto_packet *packet)
 
 	/* Free data and reset values */
 	packet->command = 0;
-	packet->have_remaining = 0;
 	packet->remaining_count = 0;
 	packet->remaining_mult = 1;
 	packet->remaining_length = 0;
@@ -155,7 +162,16 @@ int _mosquitto_packet_queue(struct mosquitto *mosq, struct _mosquitto_packet *pa
 	mosq->out_packet_last = packet;
 	pthread_mutex_unlock(&mosq->out_packet_mutex);
 #ifdef WITH_BROKER
+#  ifdef WITH_WEBSOCKETS
+	if(mosq->wsi){
+		libwebsocket_callback_on_writable(mosq->ws_context, mosq->wsi);
+		return 0;
+	}else{
+		return _mosquitto_packet_write(mosq);
+	}
+#  else
 	return _mosquitto_packet_write(mosq);
+#  endif
 #else
 
 	/* Write a single byte to sockpairW (connected to sockpairR) to break out
@@ -181,7 +197,11 @@ int _mosquitto_packet_queue(struct mosquitto *mosq, struct _mosquitto_packet *pa
  * Returns 1 on failure (context is NULL)
  * Returns 0 on success.
  */
+#ifdef WITH_BROKER
+int _mosquitto_socket_close(struct mosquitto_db *db, struct mosquitto *mosq)
+#else
 int _mosquitto_socket_close(struct mosquitto *mosq)
+#endif
 {
 	int rc = 0;
 
@@ -198,10 +218,31 @@ int _mosquitto_socket_close(struct mosquitto *mosq)
 	}
 #endif
 
-	if(mosq->sock != INVALID_SOCKET){
+	if((int)mosq->sock >= 0){
+#ifdef WITH_BROKER
+		HASH_DELETE(hh_sock, db->contexts_by_sock, mosq);
+#endif
 		rc = COMPAT_CLOSE(mosq->sock);
 		mosq->sock = INVALID_SOCKET;
+#ifdef WITH_WEBSOCKETS
+	}else if(mosq->sock == WEBSOCKET_CLIENT){
+		if(mosq->state != mosq_cs_disconnecting){
+			mosq->state = mosq_cs_disconnect_ws;
+		}
+		if(mosq->wsi){
+			libwebsocket_callback_on_writable(mosq->ws_context, mosq->wsi);
+		}
+		mosq->sock = INVALID_SOCKET;
+#endif
 	}
+
+#ifdef WITH_BROKER
+	if(mosq->listener){
+		mosq->listener->client_count--;
+		assert(mosq->listener->client_count >= 0);
+		mosq->listener = NULL;
+	}
+#endif
 
 	return rc;
 }
@@ -225,20 +266,27 @@ static unsigned int psk_client_callback(SSL *ssl, const char *hint,
 }
 #endif
 
-int _mosquitto_try_connect(const char *host, uint16_t port, int *sock, const char *bind_address, bool blocking)
+int _mosquitto_try_connect(struct mosquitto *mosq, const char *host, uint16_t port, mosq_sock_t *sock, const char *bind_address, bool blocking)
 {
 	struct addrinfo hints;
 	struct addrinfo *ainfo, *rp;
 	struct addrinfo *ainfo_bind, *rp_bind;
 	int s;
-	int rc;
+	int rc = MOSQ_ERR_SUCCESS;
 #ifdef WIN32
 	uint32_t val = 1;
 #endif
 
 	*sock = INVALID_SOCKET;
 	memset(&hints, 0, sizeof(struct addrinfo));
-	hints.ai_family = PF_UNSPEC;
+#ifdef WITH_TLS
+	if(mosq->tls_cafile || mosq->tls_capath || mosq->tls_psk){
+		hints.ai_family = PF_INET;
+	}else
+#endif
+	{
+		hints.ai_family = PF_UNSPEC;
+	}
 	hints.ai_flags = AI_ADDRCONFIG;
 	hints.ai_socktype = SOCK_STREAM;
 
@@ -266,6 +314,7 @@ int _mosquitto_try_connect(const char *host, uint16_t port, int *sock, const cha
 		}else if(rp->ai_family == PF_INET6){
 			((struct sockaddr_in6 *)rp->ai_addr)->sin6_port = htons(port);
 		}else{
+			COMPAT_CLOSE(*sock);
 			continue;
 		}
 
@@ -294,6 +343,10 @@ int _mosquitto_try_connect(const char *host, uint16_t port, int *sock, const cha
 		errno = WSAGetLastError();
 #endif
 		if(rc == 0 || errno == EINPROGRESS || errno == COMPAT_EWOULDBLOCK){
+			if(rc < 0 && (errno == EINPROGRESS || errno == COMPAT_EWOULDBLOCK)){
+				rc = MOSQ_ERR_CONN_PENDING;
+			}
+
 			if(blocking){
 				/* Set non-blocking */
 				if(_mosquitto_socket_nonblock(*sock)){
@@ -314,8 +367,34 @@ int _mosquitto_try_connect(const char *host, uint16_t port, int *sock, const cha
 	if(!rp){
 		return MOSQ_ERR_ERRNO;
 	}
+	return rc;
+}
+
+#ifdef WITH_TLS
+int mosquitto__socket_connect_tls(struct mosquitto *mosq)
+{
+	int ret;
+
+	ret = SSL_connect(mosq->ssl);
+	if(ret != 1){
+		ret = SSL_get_error(mosq->ssl, ret);
+		if(ret == SSL_ERROR_WANT_READ){
+			mosq->want_connect = true;
+			/* We always try to read anyway */
+		}else if(ret == SSL_ERROR_WANT_WRITE){
+			mosq->want_write = true;
+			mosq->want_connect = true;
+		}else{
+			COMPAT_CLOSE(mosq->sock);
+			mosq->sock = INVALID_SOCKET;
+			return MOSQ_ERR_TLS;
+		}
+	}else{
+		mosq->want_connect = false;
+	}
 	return MOSQ_ERR_SUCCESS;
 }
+#endif
 
 /* Create a socket and connect it to 'ip' on port 'port'.
  * Returns -1 on failure (ip is NULL, socket creation/connection error)
@@ -323,7 +402,7 @@ int _mosquitto_try_connect(const char *host, uint16_t port, int *sock, const cha
  */
 int _mosquitto_socket_connect(struct mosquitto *mosq, const char *host, uint16_t port, const char *bind_address, bool blocking)
 {
-	int sock = INVALID_SOCKET;
+	mosq_sock_t sock = INVALID_SOCKET;
 	int rc;
 #ifdef WITH_TLS
 	int ret;
@@ -332,14 +411,8 @@ int _mosquitto_socket_connect(struct mosquitto *mosq, const char *host, uint16_t
 
 	if(!mosq || !host || !port) return MOSQ_ERR_INVAL;
 
-#ifdef WITH_TLS
-	if(mosq->tls_cafile || mosq->tls_capath || mosq->tls_psk){
-		blocking = true;
-	}
-#endif
-
-	rc = _mosquitto_try_connect(host, port, &sock, bind_address, blocking);
-	if(rc != MOSQ_ERR_SUCCESS) return rc;
+	rc = _mosquitto_try_connect(mosq, host, port, &sock, bind_address, blocking);
+	if(rc > 0) return rc;
 
 #ifdef WITH_TLS
 	if(mosq->tls_cafile || mosq->tls_capath || mosq->tls_psk){
@@ -470,24 +543,17 @@ int _mosquitto_socket_connect(struct mosquitto *mosq, const char *host, uint16_t
 		}
 		SSL_set_bio(mosq->ssl, bio, bio);
 
-		ret = SSL_connect(mosq->ssl);
-		if(ret != 1){
-			ret = SSL_get_error(mosq->ssl, ret);
-			if(ret == SSL_ERROR_WANT_READ){
-				/* We always try to read anyway */
-			}else if(ret == SSL_ERROR_WANT_WRITE){
-				mosq->want_write = true;
-			}else{
-				COMPAT_CLOSE(sock);
-				return MOSQ_ERR_TLS;
-			}
+		mosq->sock = sock;
+		if(mosquitto__socket_connect_tls(mosq)){
+			return MOSQ_ERR_TLS;
 		}
+
 	}
 #endif
 
 	mosq->sock = sock;
 
-	return MOSQ_ERR_SUCCESS;
+	return rc;
 }
 
 int _mosquitto_read_byte(struct _mosquitto_packet *packet, uint8_t *byte)
@@ -541,9 +607,10 @@ int _mosquitto_read_string(struct _mosquitto_packet *packet, char **str)
 
 	if(packet->pos+len > packet->remaining_length) return MOSQ_ERR_PROTOCOL;
 
-	*str = _mosquitto_calloc(len+1, sizeof(char));
+	*str = _mosquitto_malloc(len+1);
 	if(*str){
 		memcpy(*str, &(packet->payload[packet->pos]), len);
+		(*str)[len] = '\0';
 		packet->pos += len;
 	}else{
 		return MOSQ_ERR_NOMEM;
@@ -697,6 +764,11 @@ int _mosquitto_packet_write(struct mosquitto *mosq)
 	}
 	pthread_mutex_unlock(&mosq->out_packet_mutex);
 
+	if(mosq->state == mosq_cs_connect_pending){
+		pthread_mutex_unlock(&mosq->current_out_packet_mutex);
+		return MOSQ_ERR_SUCCESS;
+	}
+
 	while(mosq->current_out_packet){
 		packet = mosq->current_out_packet;
 
@@ -816,6 +888,10 @@ int _mosquitto_packet_read(struct mosquitto *mosq)
 
 	if(!mosq) return MOSQ_ERR_INVAL;
 	if(mosq->sock == INVALID_SOCKET) return MOSQ_ERR_NO_CONN;
+	if(mosq->state == mosq_cs_connect_pending){
+		return MOSQ_ERR_SUCCESS;
+	}
+
 	/* This gets called if pselect() indicates that there is network data
 	 * available - ie. at least one byte.  What we do depends on what data we
 	 * already have.
@@ -858,15 +934,24 @@ int _mosquitto_packet_read(struct mosquitto *mosq)
 			}
 		}
 	}
-	if(!mosq->in_packet.have_remaining){
+	/* remaining_count is the number of bytes that the remaining_length
+	 * parameter occupied in this incoming packet. We don't use it here as such
+	 * (it is used when allocating an outgoing packet), but we must be able to
+	 * determine whether all of the remaining_length parameter has been read.
+	 * remaining_count has three states here:
+	 *   0 means that we haven't read any remaining_length bytes
+	 *   <0 means we have read some remaining_length bytes but haven't finished
+	 *   >0 means we have finished reading the remaining_length bytes.
+	 */
+	if(mosq->in_packet.remaining_count <= 0){
 		do{
 			read_length = _mosquitto_net_read(mosq, &byte, 1);
 			if(read_length == 1){
-				mosq->in_packet.remaining_count++;
+				mosq->in_packet.remaining_count--;
 				/* Max 4 bytes length for remaining length as defined by protocol.
 				 * Anything more likely means a broken/malicious client.
 				 */
-				if(mosq->in_packet.remaining_count > 4) return MOSQ_ERR_PROTOCOL;
+				if(mosq->in_packet.remaining_count < -4) return MOSQ_ERR_PROTOCOL;
 
 #if defined(WITH_BROKER) && defined(WITH_SYS_TREE)
 				g_bytes_received++;
@@ -890,13 +975,15 @@ int _mosquitto_packet_read(struct mosquitto *mosq)
 				}
 			}
 		}while((byte & 128) != 0);
+		/* We have finished reading remaining_length, so make remaining_count
+		 * positive. */
+		mosq->in_packet.remaining_count *= -1;
 
 		if(mosq->in_packet.remaining_length > 0){
 			mosq->in_packet.payload = _mosquitto_malloc(mosq->in_packet.remaining_length*sizeof(uint8_t));
 			if(!mosq->in_packet.payload) return MOSQ_ERR_NOMEM;
 			mosq->in_packet.to_process = mosq->in_packet.remaining_length;
 		}
-		mosq->in_packet.have_remaining = 1;
 	}
 	while(mosq->in_packet.to_process>0){
 		read_length = _mosquitto_net_read(mosq, &(mosq->in_packet.payload[mosq->in_packet.pos]), mosq->in_packet.to_process);
@@ -956,7 +1043,7 @@ int _mosquitto_packet_read(struct mosquitto *mosq)
 	return rc;
 }
 
-int _mosquitto_socket_nonblock(int sock)
+int _mosquitto_socket_nonblock(mosq_sock_t sock)
 {
 #ifndef WIN32
 	int opt;
@@ -983,7 +1070,7 @@ int _mosquitto_socket_nonblock(int sock)
 
 
 #ifndef WITH_BROKER
-int _mosquitto_socketpair(int *pairR, int *pairW)
+int _mosquitto_socketpair(mosq_sock_t *pairR, mosq_sock_t *pairW)
 {
 #ifdef WIN32
 	int family[2] = {AF_INET, AF_INET6};
@@ -992,12 +1079,12 @@ int _mosquitto_socketpair(int *pairR, int *pairW)
 	struct sockaddr_in *sa = (struct sockaddr_in *)&ss;
 	struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&ss;
 	socklen_t ss_len;
-	int spR, spW;
+	mosq_sock_t spR, spW;
 
-	int listensock;
+	mosq_sock_t listensock;
 
-	*pairR = -1;
-	*pairW = -1;
+	*pairR = INVALID_SOCKET;
+	*pairW = INVALID_SOCKET;
 
 	for(i=0; i<2; i++){
 		memset(&ss, 0, sizeof(ss));
